@@ -1,9 +1,10 @@
 /**
  * @file main.cpp
- * @brief 3D G-Code Viewer (Watchdog & Overflow Fix)
+ * @brief 3D G-Code Viewer (Optimized: Fixed Point, Safe Memory, 4x8ft Support)
  * @details
- *   - FIXED: Project() function now clamps coordinates to prevent int16_t overflow artifacts.
- *   - RETAINED: Watchdog/Yield fixes for stability.
+ *   - CRASH FIX: Limits RAM usage to ~6MB (750k points) to prevent system starvation.
+ *   - SCALE: 10.0f (0.1mm precision) -> Supports CNCs up to 3.2 meters (10ft).
+ *   - MEMORY: Uses int16_t fixed-point storage (8 bytes/vertex).
  */
 
 #include <Arduino.h>
@@ -39,7 +40,15 @@ String fetchURL = "https://pastebin.com/raw/vtZVze7H";
 const char* WIFI_SSID = "30BIRD-YARD";
 const char* WIFI_PASS = "oysterbox";
 
-#define MAX_POINTS 200000
+// MEMORY SETTINGS
+// 8MB Physical PSRAM - 2MB System Overhead = ~6MB Usable for Vertices
+// 6MB / 8 bytes = 750,000 points safe limit.
+#define MAX_POINTS 750000
+
+// FIXED POINT MATH SCALE (10.0f = 0.1mm Precision)
+// Range: +/- 3276mm (Approx 10 feet). Fits 4x8 CNCs nicely.
+#define STORAGE_SCALE 10.0f
+
 #define MIN_SEG_LEN 0.05f
 #define ARC_RES 2.0f
 
@@ -113,7 +122,7 @@ uint16_t TOOL_COLORS[] = {
 
 
 // =======================================================================================
-// GLOBALS
+// GLOBALS & DATA STRUCTURES
 // =======================================================================================
 Arduino_DataBus *bus = new Arduino_ESP32PAR16(
     LCD_RS, LCD_CS, LCD_WR, LCD_RD,
@@ -123,7 +132,15 @@ Arduino_DataBus *bus = new Arduino_ESP32PAR16(
 Arduino_GFX *gfx = new Arduino_ILI9488(bus, -1, 1, false);
 Arduino_Canvas *canvas;
 
-struct Vertex { float x, y, z; uint8_t type; };
+// --- OPTIMIZED VERTEX STRUCT (8 BYTES) ---
+struct Vertex {
+    int16_t x;    // Fixed point: Value * STORAGE_SCALE
+    int16_t y;
+    int16_t z;
+    uint8_t type;
+    uint8_t flags; // Padding / Future use
+};
+
 std::vector<Vertex> modelVertices;
 std::vector<String> fileList;
 
@@ -288,7 +305,7 @@ Button* allBtns[]={&btnExit,&btnIso,&btnTop,&btnFrt};
 int btnCount=4;
 
 // =======================================================================================
-// 3D ENGINE (FIXED PROJECT FUNCTION)
+// 3D ENGINE (OPTIMIZED FOR FIXED POINT)
 // =======================================================================================
 inline void project(float inX, float inY, float inZ, float cosX, float sinX, float cosY, float sinY, int16_t &outX, int16_t &outY) {
     float x = inX - modelCenterX;
@@ -300,12 +317,11 @@ inline void project(float inX, float inY, float inZ, float cosX, float sinX, flo
     float z1 = y * sinX + z * cosX;
     float x2 = x * cosY - z1 * sinY;
 
-    // Project to Screen Space using float/long to prevent immediate overflow
+    // Project to Screen
     float projX = (LCD_W / 2.0f) + panX + (x2 * modelScale);
     float projY = (LCD_H / 2.0f) + panY - (y1 * modelScale);
 
     // FIX: Clamp coordinates to safe int16_t range to prevent wrap-around artifacts
-    // 32000 is safely within int16_t (32767) but far enough off-screen for culling
     if (projX > 32000) projX = 32000;
     if (projX < -32000) projX = -32000;
     if (projY > 32000) projY = 32000;
@@ -316,39 +332,36 @@ inline void project(float inX, float inY, float inZ, float cosX, float sinX, flo
 }
 
 void renderModel() {
-    // 1. Sanity Check
     if (modelVertices.size() < 2) return;
 
-    // 2. Pre-calculate rotation math
     float cosX = cos(camRotX), sinX = sin(camRotX);
     float cosY = cos(camRotY), sinY = sin(camRotY);
 
-    // 3. Determine Step Size (Detail level)
     const size_t step = isInteracting ? DRAG_SKIP_STEPS : IDLE_SKIP_STEPS;
 
     int16_t x1, y1, x2, y2;
     Vertex &vStart = modelVertices[0];
 
-    // Project first point
-    project(vStart.x, vStart.y, vStart.z, cosX, sinX, cosY, sinY, x1, y1);
+    // UNPACK: Convert int16 -> Float using Scale
+    project(vStart.x / STORAGE_SCALE, vStart.y / STORAGE_SCALE, vStart.z / STORAGE_SCALE,
+            cosX, sinX, cosY, sinY, x1, y1);
 
     unsigned long lastYield = millis();
 
-    // LOOP THROUGH VERTICES
     for (size_t i = step; i < modelVertices.size(); i += step) {
 
         Vertex &v2 = modelVertices[i];
-        project(v2.x, v2.y, v2.z, cosX, sinX, cosY, sinY, x2, y2);
 
-        // If project() clamped the values to +/- 32000, the line is infinitely long
-        // or way off screen. Drawing a 60,000px line freezes the ESP32.
-        // We skip drawing if either point hit the safety clamp limits.
+        // UNPACK: Convert int16 -> Float using Scale
+        project(v2.x / STORAGE_SCALE, v2.y / STORAGE_SCALE, v2.z / STORAGE_SCALE,
+                cosX, sinX, cosY, sinY, x2, y2);
+
+        // Bounds Check (Clamping Safety)
         bool clamped = (x1 <= -32000 || x1 >= 32000 || y1 <= -32000 || y1 >= 32000 ||
                         x2 <= -32000 || x2 >= 32000 || y2 <= -32000 || y2 >= 32000);
 
         if (!clamped) {
-            // Standard Screen Bounds Check (Culling)
-            // Only draw if at least one part of the line touches the screen area
+            // Screen Area Culling
             if(!((x1 < -50 && x2 < -50) || (x1 > LCD_W+50 && x2 > LCD_W+50) ||
                  (y1 < -50 && y2 < -50) || (y1 > LCD_H+50 && y2 > LCD_H+50)))
             {
@@ -357,16 +370,11 @@ void renderModel() {
             }
         }
 
-        // Cycle coordinates
+        // Cycle coords
         x1 = x2; y1 = y2;
 
-        // --- FIX 3: BETTER YIELDING ---
-        // Don't count segments. Use time. Yield only once every 100ms.
-        // This prevents the "5 seconds of sleep" issue.
         if ((millis() - lastYield) > 100) {
             lastYield = millis();
-            // Since we disabled the Hardware Watchdog, we don't strictly need this
-            // for the dog, but we need it to keep WiFi alive.
             vTaskDelay(1);
         }
     }
@@ -418,37 +426,16 @@ void drawUI(int activeBtnID = -1) {
     canvas->printf("Tool: T%d\n", lastDetectedTool);
 }
 
-void safeCanvasFillScreen(uint16_t color) {
-    Serial.printf("[%lu] safeCanvasFillScreen START\n", millis());
-
-    const int stripHeight = 20;
-
-    for(int y = 0; y < LCD_H; y += stripHeight) {
-        int h = min(stripHeight, LCD_H - y);
-        canvas->fillRect(0, y, LCD_W, h, color);
-        delay(1);
-    }
-
-    Serial.printf("[%lu] safeCanvasFillScreen COMPLETE\n", millis());
-}
-
 void renderFull() {
-    Serial.printf("[%lu] >>> renderFull START\n", millis());
+    //Serial.printf("[%lu] >>> renderFull START\n", millis());
     unsigned long t0 = millis();
 
-    // 1. Clear Screen
     canvas->fillScreen(C_BG);
-
-    // 2. Draw Model & UI
     renderModel();
     drawUI();
+    canvas->flush(); // Send to LCD
 
-    // 3. Flush to LCD
-    // With WDT disabled in setup(), this slow operation is now safe.
-    Serial.printf("[%lu] canvas->flush START\n", millis());
-    canvas->flush();
-
-    Serial.printf("[TIMING] <<< renderFull COMPLETE (%lums)\n", millis() - t0);
+    //Serial.printf("[TIMING] <<< renderFull COMPLETE (%lums)\n", millis() - t0);
 }
 
 
@@ -462,7 +449,7 @@ void handleButton(int id) {
 }
 
 // =======================================================================================
-// LOADER & PARSER
+// LOADER & PARSER (FIXED POINT PACKING)
 // =======================================================================================
 struct MachineState { float x,y,z; bool abs; bool mm; int plane; int mode; int tool; };
 
@@ -476,14 +463,31 @@ float getGVal(String &s, char c, float def) {
     return s.substring(i+1, e).toFloat();
 }
 
+// --- OPTIMIZED ADDPOINT ---
 void addPoint(float x, float y, float z, uint8_t type) {
     if(modelVertices.size()>=MAX_POINTS) { memoryFull=true; return; }
+
+    // Optimization: Skip if too close (unpacked check)
     if (modelVertices.size()>0) {
         Vertex &last=modelVertices.back();
-        float distSq=pow(x-last.x,2)+pow(y-last.y,2)+pow(z-last.z,2);
+        float lx = last.x / STORAGE_SCALE;
+        float ly = last.y / STORAGE_SCALE;
+        float lz = last.z / STORAGE_SCALE;
+        float distSq=pow(x-lx,2)+pow(y-ly,2)+pow(z-lz,2);
         if (distSq<(MIN_SEG_LEN*MIN_SEG_LEN)) return;
     }
-    modelVertices.push_back({x, y, z, type});
+
+    // PACK: Float -> Int16
+    int32_t ix = (int32_t)(x * STORAGE_SCALE);
+    int32_t iy = (int32_t)(y * STORAGE_SCALE);
+    int32_t iz = (int32_t)(z * STORAGE_SCALE);
+
+    // SAFETY CLAMP (Prevent overflow wrapping)
+    if(ix > 32767) ix = 32767; if(ix < -32768) ix = -32768;
+    if(iy > 32767) iy = 32767; if(iy < -32768) iy = -32768;
+    if(iz > 32767) iz = 32767; if(iz < -32768) iz = -32768;
+
+    modelVertices.push_back({(int16_t)ix, (int16_t)iy, (int16_t)iz, type, 0});
     updateBounds(x,y,z);
 }
 
@@ -576,7 +580,6 @@ void fetchFromServer() {
     log("Sending GET Request...");
     unsigned long requestStart = millis();
     int code = http.GET();
-    Serial.printf("[TIMING] GET request took %lums\n", millis() - requestStart);
 
     if (code > 0) {
         log("HTTP Code: " + String(code));
@@ -590,8 +593,15 @@ void fetchFromServer() {
             if (psramFound()) {
                 size_t freeMem = ESP.getFreePsram();
                 log("Free PSRAM: " + String(freeMem));
-                if (freeMem > (MAX_POINTS * sizeof(Vertex) + 100000))
-                    modelVertices.reserve(MAX_POINTS);
+
+                // CRASH FIX: Reserve safe amount
+                // Leave 1MB headroom for system
+                size_t safeCapacity = (freeMem - 1000000) / sizeof(Vertex);
+                if (safeCapacity > MAX_POINTS) safeCapacity = MAX_POINTS;
+
+                log("Reserving: " + String(safeCapacity));
+                modelVertices.clear();
+                modelVertices.reserve(safeCapacity);
             }
 
             camRotX = -0.78; camRotY = 0.78; panX = 0; panY = 0;
@@ -603,16 +613,14 @@ void fetchFromServer() {
             int nextTool = 1;
             int activeTool = 1;
 
-            modelVertices.push_back({0, 0, 0, 0});
+            // Push origin
+            modelVertices.push_back({0, 0, 0, 0, 0});
 
             int linesProcessed = 0;
             unsigned long lastUpdate = millis();
-            unsigned long lastReadTime = millis();
-            unsigned long streamStart = millis();
+            unsigned long lastData = millis();
 
             log("Starting Stream...");
-
-            unsigned long lastData = millis();
 
             while (true) {
                 vTaskDelay(pdMS_TO_TICKS(2));
@@ -630,11 +638,8 @@ void fetchFromServer() {
 
                     linesProcessed++;
                     lastData = millis();
-
-                    if (len > 0) len -= (l.length() + 1);
                 }
                 else {
-                    // If no data for 1000ms → treat as END OF FILE (not a timeout)
                     if (millis() - lastData > 1000) {
                         log("Stream ended normally.");
                         break;
@@ -649,10 +654,6 @@ void fetchFromServer() {
                     gfx->setTextColor(YELLOW);
                 }
             }
-
-
-            Serial.printf("[TIMING] Stream download took %lums\n", millis() - streamStart);
-            Serial.printf("[TIMING] Lines processed: %d, Vertices: %d\n", linesProcessed, modelVertices.size());
 
             DEBUG_POINT("Stream complete");
             log("Download Complete.", C_LOG_TXT);
@@ -671,40 +672,24 @@ void fetchFromServer() {
         return;
     }
 
-    unsigned long httpEndStart = millis();
-    DEBUG_POINT("http.end()");
     http.end();
-    Serial.printf("[TIMING] http.end() took %lums\n", millis() - httpEndStart);
-
-    unsigned long wifiDisconnectStart = millis();
-    DEBUG_POINT("WiFi.disconnect()");
     WiFi.disconnect();
-    Serial.printf("[TIMING] WiFi.disconnect() took %lums\n", millis() - wifiDisconnectStart);
 
-    unsigned long calcStart = millis();
     modelCenterX = (minX + maxX) / 2;
     modelCenterY = (minY + maxY) / 2;
     modelCenterZ = (minZ + maxZ) / 2;
     float maxD = max(maxX - minX, max(maxY - minY, maxZ - minZ));
     modelScale = (maxD > 0) ? (280.0f / maxD) : 1.0f;
-    Serial.printf("[TIMING] Bounds calculation took %lums\n", millis() - calcStart);
 
     DEBUG_POINT("Starting render after download");
     log("Rendering...", C_LOG_TXT);
 
-    unsigned long renderStart = millis();
     delay(50);
-
     inFileMenu = false;
-    renderFull();  // This has its own timing inside
-
-    Serial.printf("[TIMING] Total render sequence took %lums\n", millis() - renderStart);
-    Serial.printf("[TIMING] ==== TOTAL fetchFromServer took %lums ====\n", millis() - fetchStart);
-
-    DEBUG_POINT("fetchFromServer COMPLETE");
+    renderFull();
 }
 
-// --- LOAD FROM SPIFFS ---
+// --- LOAD FROM SPIFFS (CRASH FIXED) ---
 void loadAndParseFile(String path) {
     DEBUG_POINT("loadAndParseFile START");
     Serial.println("File: " + path);
@@ -712,9 +697,21 @@ void loadAndParseFile(String path) {
     gfx->fillScreen(C_BG);
     gfx->setCursor(20, 150); gfx->setTextSize(2); gfx->setTextColor(GREEN); gfx->print("Loading...");
 
+    // 1. SAFE MEMORY ALLOCATION
     if(psramFound()) {
-        if(ESP.getFreePsram() > (MAX_POINTS * sizeof(Vertex) + 50000))
-            modelVertices.reserve(MAX_POINTS);
+        size_t freeMem = ESP.getFreePsram();
+        Serial.printf("Free PSRAM: %d\n", freeMem);
+
+        // Calculate max safe capacity leaving 1.5MB buffer for system/wifi/stack
+        size_t safeCapacity = (freeMem - 1500000) / sizeof(Vertex);
+        if (safeCapacity > MAX_POINTS) safeCapacity = MAX_POINTS;
+
+        Serial.printf("Reserving %d vertices\n", safeCapacity);
+        modelVertices.clear();
+        modelVertices.reserve(safeCapacity);
+    } else {
+        Serial.println("ERR: No PSRAM found!");
+        return;
     }
 
     camRotX=-0.78; camRotY=0.78; panX=0; panY=0;
@@ -724,60 +721,52 @@ void loadAndParseFile(String path) {
 
     if (!path.startsWith("/")) path = "/" + path;
 
-    DEBUG_POINT("Opening file");
-    File f=SPIFFS.open(path, FILE_READ);
+    File f = SPIFFS.open(path, FILE_READ);
     if(!f) {
-        DEBUG_POINT("File open FAILED");
+        Serial.println("File open error");
         return;
     }
-    long fSize=f.size();
-    Serial.printf("File size: %ld bytes\n", fSize);
 
-    MachineState st={0,0,0,false,true,0,0,1};
+    long fSize = f.size();
+    MachineState st = {0,0,0,false,true,0,0,1};
     int nextTool = 1;
     int activeTool = 1;
 
-    modelVertices.push_back({0,0,0,0});
-    uint32_t lastYield=millis();
+    modelVertices.push_back({0,0,0,0,0});
+
+    uint32_t lastYield = millis();
     int lineCount = 0;
 
-    DEBUG_POINT("Parsing file");
+    Serial.println("Parsing...");
+
     while(f.available()){
         if(memoryFull) break;
 
         lineCount++;
 
-        if(lineCount % 100 == 0) {
-            Serial.printf("[%lu] Parsed %d lines, %d vertices\n", millis(), lineCount, modelVertices.size());
+        // CRASH FIX: Yield more frequently during file I/O
+        if(lineCount % 50 == 0 || millis() - lastYield > 50) {
+            vTaskDelay(1);
+            lastYield = millis();
         }
 
-        if(millis()-lastYield > 100) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            lastYield=millis();
-        }
-
-        String l=f.readStringUntil('\n');
+        String l = f.readStringUntil('\n');
         processLine(l, st, nextTool, activeTool);
 
-        if(f.position()%8192<100) {
-            int w=(f.position()*460)/fSize;
-            gfx->fillRect(10,200,w,10,GREEN);
+        if(f.position() % 8192 < 100) {
+            int w = (f.position() * 460) / fSize;
+            gfx->fillRect(10, 200, w, 10, GREEN);
         }
     }
     f.close();
-
-    DEBUG_POINT("File parsing complete");
-    Serial.printf("Total: %d lines, %d vertices\n", lineCount, modelVertices.size());
+    Serial.printf("Done. Lines: %d, Verts: %d\n", lineCount, modelVertices.size());
 
     modelCenterX=(minX+maxX)/2; modelCenterY=(minY+maxY)/2; modelCenterZ=(minZ+maxZ)/2;
     float maxD=max(maxX-minX,max(maxY-minY,maxZ-minZ));
     modelScale=(maxD>0)?(280.0f/maxD):1.0f;
 
-    DEBUG_POINT("Starting render after load");
     inFileMenu=false;
     renderFull();
-
-    DEBUG_POINT("loadAndParseFile COMPLETE");
 }
 
 void createSampleFile() {
@@ -807,30 +796,19 @@ void createSampleFile() {
 void setup() {
     Serial.begin(115200);
 
-    // =============================================================
-    // WATCHDOG FIX (Based on your provided headers)
-    // =============================================================
-
-    // 1. Configure the high-level software watchdog to 60s (prevents software panic)
+    // Watchdog Config
     esp_task_wdt_init(60, false);
-
-    // 2. Disable Hardware Watchdog for Timer Group 1 (The one causing the crash)
-    // We use the exact member names found in your timer_group_struct.h
-    TIMERG1.wdtwprotect.wdt_wkey = 0x50D83AA1; // Unlock using the magic number
-    TIMERG1.wdtconfig0.wdt_en = 0;             // Disable bit (wdt_en)
-    TIMERG1.wdtwprotect.wdt_wkey = 0;          // Lock
-
-    // 3. Disable Timer Group 0 as well (Safety measure)
+    TIMERG1.wdtwprotect.wdt_wkey = 0x50D83AA1;
+    TIMERG1.wdtconfig0.wdt_en = 0;
+    TIMERG1.wdtwprotect.wdt_wkey = 0;
     TIMERG0.wdtwprotect.wdt_wkey = 0x50D83AA1;
     TIMERG0.wdtconfig0.wdt_en = 0;
     TIMERG0.wdtwprotect.wdt_wkey = 0;
 
-    // =============================================================
-
     init_hardware();
 
-    pixels.begin(); // INITIALIZE NeoPixel strip object (REQUIRED)
-    pixels.clear(); // Set all pixel colors to 'off'
+    pixels.begin();
+    pixels.clear();
     pixels.show();
 
     gfx->begin();
@@ -866,15 +844,13 @@ void setup() {
 
 
 void loop() {
-
     static unsigned long lastHeartbeat = 0;
-
-    // Heartbeat every 10 seconds to show we're alive
     if(millis() - lastHeartbeat > 10000) {
         Serial.printf("[%lu] HEARTBEAT - Heap: %d, PSRAM: %d\n",
                       millis(), ESP.getFreeHeap(), ESP.getFreePsram());
         lastHeartbeat = millis();
     }
+
     readTouch();
 
     static uint8_t prevTouchCount = 0;
